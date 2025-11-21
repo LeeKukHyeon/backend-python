@@ -22,4 +22,4 @@ jobs:
 
       - name: Push Docker image to internal registry
         run: |
-          docker push 211.106.171.36:51999/k8s-ai-manager:latest
+          docker --tls-verify=false push 211.106.171.36:51999/k8s-ai-manager:latest
