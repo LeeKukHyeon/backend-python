@@ -1,0 +1,25 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main  # main 브랜치에 push되면 실행
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker image
+        run: |
+          docker build -t 211.106.171.36:51999/k8s-ai-manager:latest .
+
+      - name: Push Docker image to internal registry
+        run: |
+          docker push 211.106.171.36:51999/k8s-ai-manager:latest
