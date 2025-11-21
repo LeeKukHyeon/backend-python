@@ -16,10 +16,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build Docker image
-        run: |
-          docker build -t 211.106.171.36:51999/k8s-ai-manager:latest .
-
-      - name: Push Docker image to internal registry
-        run: |
-          docker push 211.106.171.36:51999/k8s-ai-manager:latest
+      - name: Docker Login
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      
+      - name: Build Docker Image
+        run: docker build -t lkh8150/docker:latest .
+      
+      - name: Push Docker Image
+        run: docker push lkh8150/docker:latest
