@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+kubernetes
+pyyaml
+aiofiles
+python-multipart
+paramiko
