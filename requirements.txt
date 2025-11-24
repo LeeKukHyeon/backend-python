@@ -1,8 +1,5 @@
 fastapi
 uvicorn[standard]
-pydantic
+openai
 kubernetes
-pyyaml
-aiofiles
-python-multipart
-paramiko
+pydantic
