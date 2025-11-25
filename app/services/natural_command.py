@@ -1,11 +1,15 @@
 import os
 import json
 from openai import OpenAI
+import openai
 
 OPENAI_API_KEY = "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"#os.environ.get("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("환경변수 OPENAI_API_KEY 가 설정되지 않았습니다. K8s secretMount 확인 필요")
+
+models = openai.Model.list()
+print(models)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
