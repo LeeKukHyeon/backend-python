@@ -327,9 +327,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         Namespace: {namespace}
         App name: {app_name}
 
-        이 정보를 기반으로 Kubernetes Deployment.yaml, Service.yaml, kustomization.yaml, ArgoCD Application(app.yaml) 생성해주세요.
-        다음 형식으로 **정확히 JSON만** 반환하세요.  
-        절대로 추가 설명을 붙이지 마세요.
+        아래 형식으로 **JSON만** 반환해주세요.  
+절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
         {{
           "deployment_yaml": "...",
           "service_yaml": "...",
