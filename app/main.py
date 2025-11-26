@@ -265,7 +265,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             existing_file = repository.get_contents(path)
             repository.update_file(path, "Update Docker build workflow", workflow_content, existing_file.sha)
             session["stage"] = "argocd_setup"
-            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다."}
+            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다. "}
 
         except:
             repository.create_file(path, "Add Docker build workflow", workflow_content)
@@ -274,6 +274,18 @@ URL이 없으면 빈 문자열("")을 반환하세요.
 
 
     elif session["stage"] == "argocd_setup":
+        user = gh.get_user()
+        repo_name = session["repo"] + "argoCD"
+        description = session["repo"] + "argoCD description"
+        repo = user.create_repo(
+            name=repo_name,
+            description=description,
+            private=False  # 필요 시 True로 변경
+        )
+
+
+
+
         owner, repo = session["owner"], session["repo"]
         github_url = session["github_url"]
         repo_name = session["dockerhub_repo_name"]
@@ -303,47 +315,47 @@ URL이 없으면 빈 문자열("")을 반환하세요.
 
         argocd_url = ARGOCD_URL.rstrip("/")
 
-        application_payload = {
-            "metadata": {
-                "name": app_name,
-                "namespace": namespace,
-                "annotations": {
-                    # ArgoCD Image Updater annotation
-                    "argocd-image-updater.argoproj.io/myapp.update-strategy": "latest",
-                    "argocd-image-updater.argoproj.io/image-list": f"{DOCKERHUB_USERNAME}/{repo_name}"
-                }
-            },
-            "spec": {
-                "project": "default",
-                "source": {
-                    "repoURL": github_url,
-                    "path": req.repo_path,
-                    "targetRevision": branch
-                },
-                "destination": {
-                    "server": "https://kubernetes.default.svc",
-                    "namespace": namespace
-                },
-                "syncPolicy": {"automated": {"prune": True, "selfHeal": True}}
-            }
-        }
+        app_yaml = f"""
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: {app_name}
+          namespace: argocd
+          annotations:
+            argocd-image-updater.argoproj.io/image-list: {DOCKERHUB_USERNAME}/{repo_name}
+            argocd-image-updater.argoproj.io/{repo_name}.update-strategy: latest
+        spec:
+          project: default
+          source:
+            repoURL: {github_url}
+            targetRevision: {branch}
+            path: .
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: {namespace}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+        """
 
-        headers = {"Authorization": f"Bearer {ARGOCD_TOKEN}"}
+        # -----------------------------
+        # 2) GitHub repo에 YAML 커밋/푸시
+        # -----------------------------
+        try:
+            repo.create_file(
+                path="argo-cd-app.yaml",
+                message=f"Add ArgoCD Application for {app_name}",
+                content=app_yaml
+            )
+            gpt_msg = f"ArgoCD Application YAML을 생성하고 GitHub repo {repo_name}에 푸시했습니다."
+        except Exception as e:
+            gpt_msg = f"ArgoCD Application YAML 생성/푸시 실패: {str(e)}"
 
+        # 세션 단계 완료
+        session["stage"] = "completed"
 
-        async with httpx.AsyncClient(verify=False) as client:
-            res = await client.post(f"{argocd_url}/api/v1/applications", headers=headers, json=app_data)
-            if res.status_code in [200, 201]:
-                session["stage"] = "completed"
-                return {
-                    "message": f"ArgoCD Application '{app_name}' 생성 완료. 이제 CI/CD 자동 배포가 활성화됩니다."
-                }
-            else:
-                return {
-                    "message": f"ArgoCD Application 생성 실패: {res.text}"
-                }
-
-
+        return {"message": gpt_msg, "namespace": namespace, "app_name": app_name}
     # -----------------------
     # 완료
     # -----------------------
