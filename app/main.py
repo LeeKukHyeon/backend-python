@@ -1,105 +1,143 @@
 import os
 from fastapi import FastAPI
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import openai
-from typing import Dict
+import base64
+from github import Github
+from typing import Optional
 
-app = FastAPI(title="K8s AI Manager GPT Chat")
+# 환경변수 (Secret에서 로드)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+DOCKERHUB_USERNAME = os.environ.get("DOCKERHUB_USERNAME")
+DOCKERHUB_PASSWORD = os.environ.get("DOCKERHUB_PASSWORD")
+ARGOCD_URL = os.environ.get("ARGOCD_URL")
+ARGOCD_TOKEN = os.environ.get("ARGOCD_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# GitHub 객체
+gh = Github(GITHUB_TOKEN)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DOCKERHUB_USERNAME = os.getenv("DOCKERHUB_USERNAME")
-DOCKERHUB_PASSWORD = os.getenv("DOCKERHUB_PASSWORD")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+app = FastAPI(title="CI/CD GPT Manager")
 
-openai.api_key = OPENAI_API_KEY
-
-# 세션 상태 저장
-session_store: Dict[str, Dict] = {}
-
-
+# -------------------------------
+# Request 모델
+# -------------------------------
 class ChatRequest(BaseModel):
-    session_id: str  # 대화 세션 식별
-    message: str  # 사용자 자연어 입력
+    message: str  # 사용자가 보낸 전체 메시지 (예: "이 repo 배포해줘: https://github.com/user/repo")
+    github_url: Optional[str] = None
 
+# -------------------------------
+# 유틸 함수
+# -------------------------------
+def parse_github_url(url: str):
+    # https://github.com/user/repo → owner=user, repo=repo
+    parts = url.rstrip("/").split("/")
+    return parts[-2], parts[-1]
 
-def parse_github_url(message: str):
-    import re
-    match = re.search(r"https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)", message)
-    if match:
-        return match.group(1), match.group(2)
-    return None, None
+async def check_dockerfile_exists(owner, repo):
+    try:
+        repository = gh.get_repo(f"{owner}/{repo}")
+        repository.get_contents("Dockerfile")
+        return True
+    except:
+        return False
 
-
-async def check_dockerfile_exists(owner: str, repo: str) -> bool:
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents"
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+async def check_dockerhub_repo(repo_name):
+    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
     async with httpx.AsyncClient() as client:
-        res = await client.get(url, headers=headers)
-        if res.status_code != 200:
-            return False
-        files = res.json()
-        return any(f["name"].lower() == "dockerfile" for f in files)
-
-
-async def check_dockerhub_repo(repo: str) -> bool:
-    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo}/"
-    headers = {"Authorization": f"JWT {DOCKERHUB_PASSWORD}"}
-    async with httpx.AsyncClient() as client:
-        res = await client.get(url, headers=headers)
+        res = await client.get(url, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD))
         return res.status_code == 200
 
+async def generate_dockerfile(owner, repo):
+    # GPT에게 Dockerfile 예제 요청
+    # 여기서는 예시로 단순 Python FastAPI Dockerfile
+    dockerfile_content = """FROM python:3.11-slim
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir fastapi uvicorn
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+    # GitHub에 Dockerfile 생성
+    repository = gh.get_repo(f"{owner}/{repo}")
+    try:
+        repository.create_file("Dockerfile", "Add Dockerfile", dockerfile_content)
+        return True
+    except:
+        return False
 
-async def query_gpt(prompt: str) -> str:
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+async def create_argocd_app(app_name, repo_url, path, cluster_url, namespace):
+    url = f"{cluster_url}/api/v1/applications"
+    headers = {"Authorization": f"Bearer {ARGOCD_TOKEN}"}
+    data = {
+        "metadata": {"name": app_name},
+        "spec": {
+            "source": {"repoURL": repo_url, "path": path},
+            "destination": {"server": cluster_url, "namespace": namespace},
+            "project": "default",
+        }
+    }
+    async with httpx.AsyncClient(verify=False) as client:
+        res = await client.post(url, headers=headers, json=data)
+        return res.status_code, res.json()
+
+async def query_gpt(prompt: str):
+    import openai
+    openai.api_key = OPENAI_API_KEY
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.7
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content
 
-
+# -------------------------------
+# 대화형 API 엔드포인트
+# -------------------------------
 @app.post("/api/ci/chat")
 async def ci_chat(req: ChatRequest):
-    # 세션 상태 초기화
-    session = session_store.get(req.session_id, {})
+    if not req.github_url:
+        # 메시지에서 URL 추출
+        import re
+        match = re.search(r"https://github\.com/\S+", req.message)
+        if match:
+            req.github_url = match.group(0)
+        else:
+            return {"message": "GitHub URL을 찾을 수 없습니다."}
 
-    # GitHub URL 추출
-    owner, repo = parse_github_url(req.message)
-    if owner and repo and ("github_url" not in session):
-        session["github_url"] = f"https://github.com/{owner}/{repo}"
-        session["dockerfile_exists"] = await check_dockerfile_exists(owner, repo)
-        session["dockerhub_repo_exists"] = await check_dockerhub_repo(repo)
-        session["stage"] = "init"
+    owner, repo = parse_github_url(req.github_url)
 
-    # GPT 프롬프트 구성
+    dockerfile_exists = await check_dockerfile_exists(owner, repo)
+    dockerhub_repo_exists = await check_dockerhub_repo(repo)
+
     prompt = f"""
+사용자가 깃허브 URL을 전달했습니다: {req.github_url}
+현재 상태:
+- Dockerfile 존재 여부: {dockerfile_exists}
+- Docker Hub Repo 존재 여부: {dockerhub_repo_exists}
+
 사용자 메시지: {req.message}
-현재 세션 상태: {session}
 
-대화형으로 안내하면서 단계별 진행:
-1) Dockerfile 생성 여부 질문
-2) Dockerfile 예제 코드 생성
-3) GitHub Action workflow 안내
-4) Docker Hub 이미지 푸시 안내
-
-사용자에게 단계별 선택지를 제시하고, 코드 블록은 Markdown 스타일로 포함하세요.
+단계별 대화식으로 안내하며 다음 작업 진행:
+1) Dockerfile 생성 필요 시 예제 코드 제공
+2) GitHub Action workflow 안내
+3) Docker Hub 이미지 푸시 안내
+4) ArgoCD Application 생성 안내
 """
 
     gpt_response = await query_gpt(prompt)
 
-    # 세션 업데이트
-    session_store[req.session_id] = session
+    # Dockerfile 없는 경우 자동 생성
+    if not dockerfile_exists:
+        success = await generate_dockerfile(owner, repo)
+        if success:
+            gpt_response += "\n\nDockerfile을 생성하고 GitHub에 푸시했습니다."
+            dockerfile_exists = True
+        else:
+            gpt_response += "\n\nDockerfile 생성 중 오류 발생!"
 
     return {
         "message": gpt_response,
-        "session_state": session
+        "dockerfile_exists": dockerfile_exists,
+        "dockerhub_repo_exists": dockerhub_repo_exists
     }
