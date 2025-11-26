@@ -3,13 +3,12 @@ import os
 import openai
 from fastapi import FastAPI
 from pydantic import BaseModel
-from github import Github
-import httpx
 from typing import Optional
-import re
-import asyncio
+import httpx
+import json
+from github import Github
 
-# 환경변수
+# 환경변수 (Secret에서 로드)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 DOCKERHUB_USERNAME = os.environ.get("DOCKERHUB_USERNAME")
 DOCKERHUB_PASSWORD = os.environ.get("DOCKERHUB_PASSWORD")
@@ -17,31 +16,40 @@ ARGOCD_URL = os.environ.get("ARGOCD_URL")
 ARGOCD_TOKEN = os.environ.get("ARGOCD_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
+# GitHub 객체
 gh = Github(GITHUB_TOKEN)
-app = FastAPI(title="GPT 기반 대화형 CI/CD Manager")
+
+app = FastAPI(title="CI/CD GPT Manager")
 
 # -------------------------------
 # Request 모델
 # -------------------------------
 class ChatRequest(BaseModel):
-    message: str
-    github_url: Optional[str] = None
-
-# -------------------------------
-# 상태 관리 (메모리 기반, 필요시 Redis 등으로 변경 가능)
-# -------------------------------
-sessions = {}  # {github_url: {"stage": str, "dockerfile_exists": bool, "dockerhub_exists": bool}}
+    message: str  # 사용자가 보낸 전체 메시지
 
 # -------------------------------
 # 유틸 함수
 # -------------------------------
-def parse_github_url(url: str):
-    parts = url.rstrip("/").split("/")
-    return parts[-2], parts[-1]
+async def query_gpt(prompt: str) -> str:
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7
+    )
+    return response.choices[0].message.content
 
 async def check_dockerfile_exists(owner, repo):
     try:
-        gh.get_repo(f"{owner}/{repo}").get_contents("Dockerfile")
+        repository = gh.get_repo(f"{owner}/{repo}")
+        repository.get_contents("Dockerfile")
+        return True
+    except:
+        return False
+
+async def generate_dockerfile(owner, repo, content):
+    repository = gh.get_repo(f"{owner}/{repo}")
+    try:
+        repository.create_file("Dockerfile", "Add Dockerfile", content)
         return True
     except:
         return False
@@ -52,46 +60,12 @@ async def check_dockerhub_repo(repo_name):
         res = await client.get(url, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD))
         return res.status_code == 200
 
-async def generate_dockerfile(owner, repo):
-    dockerfile_content = """FROM python:3.11-slim
-WORKDIR /app
-COPY . /app
-RUN pip install --no-cache-dir fastapi uvicorn httpx PyGithub
-EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-"""
-    repository = gh.get_repo(f"{owner}/{repo}")
-    try:
-        repository.create_file("Dockerfile", "Add Dockerfile", dockerfile_content)
-        return True
-    except:
-        return False
-
-async def create_github_action(owner, repo, dockerhub_repo):
-    workflow_content = f"""name: CI/CD
-
-on:
-  push:
-    branches: [ main ]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Build Docker image
-        run: docker build -t {DOCKERHUB_USERNAME}/{dockerhub_repo}:latest .
-      - name: Login DockerHub
-        run: echo ${{{{ secrets.DOCKERHUB_PASSWORD }}}} | docker login -u {DOCKERHUB_USERNAME} --password-stdin
-      - name: Push Docker image
-        run: docker push {DOCKERHUB_USERNAME}/{dockerhub_repo}:latest
-"""
-    repository = gh.get_repo(f"{owner}/{repo}")
-    try:
-        repository.create_file(".github/workflows/ci-cd.yml", "Add CI/CD workflow", workflow_content)
-        return True
-    except:
-        return False
+async def create_dockerhub_repo(repo_name, description=""):
+    url = f"https://hub.docker.com/v2/repositories/"
+    data = {"name": repo_name, "description": description, "is_private": False}
+    async with httpx.AsyncClient() as client:
+        res = await client.post(url, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD), json=data)
+        return res.status_code == 201
 
 async def create_argocd_app(app_name, repo_url, path, cluster_url, namespace):
     url = f"{cluster_url}/api/v1/applications"
@@ -108,85 +82,83 @@ async def create_argocd_app(app_name, repo_url, path, cluster_url, namespace):
         res = await client.post(url, headers=headers, json=data)
         return res.status_code, res.json()
 
-async def query_gpt(prompt: str) -> str:
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
-    return response.choices[0].message.content
-
 # -------------------------------
-# 대화형 API
+# 대화형 API 엔드포인트
 # -------------------------------
 @app.post("/api/ci/chat")
 async def ci_chat(req: ChatRequest):
-    # GitHub URL 추출
-    if not req.github_url:
-        match = re.search(r"https://github\.com/\S+", req.message)
-        if match:
-            req.github_url = match.group(0)
-        else:
-            return {"message": "GitHub URL을 찾을 수 없습니다."}
+    # 1) GPT에게 메시지 분석하여 GitHub owner/repo 가져오기
+    parse_prompt = f"""
+사용자 메시지: "{req.message}"
 
-    owner, repo = parse_github_url(req.github_url)
-
-    # 세션 초기화
-    if req.github_url not in sessions:
-        dockerfile_exists = await check_dockerfile_exists(owner, repo)
-        dockerhub_exists = await check_dockerhub_repo(repo)
-        sessions[req.github_url] = {
-            "stage": "dockerfile_check",
-            "dockerfile_exists": dockerfile_exists,
-            "dockerhub_exists": dockerhub_exists
-        }
-
-    session = sessions[req.github_url]
-
-    # -------------------------------
-    # 단계별 처리
-    # -------------------------------
-    gpt_prompt = f"""
-사용자가 GitHub URL과 메시지를 보냈습니다: {req.github_url}
-현재 상태: {session}
-사용자 메시지: {req.message}
-대화형으로 다음 단계 안내 후 필요한 코드/명령 제공
+GitHub URL을 찾아서 owner와 repo 이름을 JSON으로 반환하세요.
+출력 형식:
+{{
+  "owner": "...",
+  "repo": "...",
+  "error": null
+}}
+URL이 없거나 잘못되면 error에 설명을 넣으세요.
 """
+    gpt_output = await query_gpt(parse_prompt)
+    try:
+        repo_info = json.loads(gpt_output)
+        error = repo_info.get("error")
+        if error:
+            return {"message": f"GitHub URL 처리 오류: {error}"}
+        owner, repo = repo_info.get("owner"), repo_info.get("repo")
+    except Exception as e:
+        return {"message": f"GPT 응답 파싱 실패: {str(e)}", "gpt_output": gpt_output}
 
-    gpt_response = await query_gpt(gpt_prompt)
+    # 2) Dockerfile 확인
+    dockerfile_exists = await check_dockerfile_exists(owner, repo)
+    dockerhub_repo_exists = await check_dockerhub_repo(repo)
 
-    # Dockerfile 생성 단계
-    if session["stage"] == "dockerfile_check" and not session["dockerfile_exists"]:
-        success = await generate_dockerfile(owner, repo)
+    # GPT에게 현재 상태와 대화형 진행 안내
+    prompt = f"""
+사용자가 repository를 배포하고 싶어합니다.
+GitHub repo: {owner}/{repo}
+현재 상태:
+- Dockerfile 존재 여부: {dockerfile_exists}
+- Docker Hub Repo 존재 여부: {dockerhub_repo_exists}
+
+사용자 메시지: {req.message}
+
+단계별로 대화형 안내:
+1) Dockerfile 생성 필요 시 예제 코드 제공
+2) GitHub Action workflow 안내
+3) Docker Hub 이미지 푸시 안내
+4) ArgoCD Application 생성 안내
+"""
+    gpt_response = await query_gpt(prompt)
+
+    # Dockerfile 없는 경우 GPT 안내 내용 기반으로 생성
+    if not dockerfile_exists:
+        # 예제 Dockerfile 요청
+        dockerfile_prompt = f"GitHub repo {owner}/{repo}에 적합한 Dockerfile 예제를 만들어주세요."
+        dockerfile_content = await query_gpt(dockerfile_prompt)
+        success = await generate_dockerfile(owner, repo, dockerfile_content)
         if success:
-            session["dockerfile_exists"] = True
-            session["stage"] = "dockerhub_check"
-            gpt_response += "\n\nDockerfile 생성 완료! 다음 단계: Docker Hub 레포 확인/생성"
+            gpt_response += "\n\nDockerfile을 생성하고 GitHub에 푸시했습니다."
+            dockerfile_exists = True
         else:
-            gpt_response += "\n\nDockerfile 생성 실패!"
+            gpt_response += "\n\nDockerfile 생성 중 오류 발생!"
 
-    # Docker Hub 레포 단계
-    elif session["stage"] == "dockerhub_check":
-        if not session["dockerhub_exists"]:
-            # 여기서 GPT가 레포 이름 물어보고, 생성하도록 안내할 수 있음
-            # 예시로 repo 이름 그대로 사용
-            session["dockerhub_exists"] = True
-            session["stage"] = "github_action"
-            gpt_response += "\n\nDocker Hub 레포 생성 완료! 다음 단계: GitHub Action workflow 생성"
-
-    # GitHub Action workflow 단계
-    elif session["stage"] == "github_action":
-        await create_github_action(owner, repo, repo)
-        session["stage"] = "argocd_app"
-        gpt_response += "\n\nGitHub Action workflow 생성 완료! 다음 단계: ArgoCD Application 생성"
-
-    # ArgoCD 단계
-    elif session["stage"] == "argocd_app":
-        await create_argocd_app(repo, req.github_url, ".", ARGOCD_URL, "default")
-        session["stage"] = "completed"
-        gpt_response += "\n\nArgoCD Application 생성 완료! CI/CD 자동 배포 구성 완료!"
+    # Docker Hub 레포 없으면 생성
+    if not dockerhub_repo_exists:
+        dockerhub_prompt = f"사용자가 Docker Hub에 {repo} 이름으로 레포를 만들고 싶어합니다. 생성해도 될까요?"
+        create_resp = await query_gpt(dockerhub_prompt)
+        # 간단히 yes 포함 여부로 판단
+        if "yes" in create_resp.lower():
+            success = await create_dockerhub_repo(repo)
+            if success:
+                gpt_response += f"\n\nDocker Hub 레포 {repo}를 생성했습니다."
+                dockerhub_repo_exists = True
+            else:
+                gpt_response += "\n\nDocker Hub 레포 생성 실패!"
 
     return {
         "message": gpt_response,
-        "session": session
+        "dockerfile_exists": dockerfile_exists,
+        "dockerhub_repo_exists": dockerhub_repo_exists
     }
