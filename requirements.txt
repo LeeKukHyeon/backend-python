@@ -4,3 +4,4 @@ pydantic
 openai
 kubernetes
 requests
+PyGithub>=1.59.0
