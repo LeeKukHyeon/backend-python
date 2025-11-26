@@ -73,7 +73,7 @@ async def check_dockerhub_repo(repo_name):
         return res.status_code == 200
 
 async def create_dockerhub_repo(repo_name: str):
-    url = "https://hub.docker.com/v2/repositories/"
+    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
     data = {
         "namespace": DOCKERHUB_USERNAME,
         "name": repo_name,
@@ -84,9 +84,13 @@ async def create_dockerhub_repo(repo_name: str):
         res = await client.post(
             url,
             json=data,
-            auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD)
+            auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD)  # 또는 Access Token
         )
-        return res.status_code in [200, 201]
+        if res.status_code in [200, 201]:
+            return True
+        else:
+            print("Docker Hub 생성 실패:", res.status_code, res.text)
+            return False
 
 
 async def dockerhub_repo_exists(repo_name: str):
