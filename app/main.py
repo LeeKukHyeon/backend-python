@@ -147,8 +147,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             session["primary_lang"] = primary_lang
             return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}로 생성하도록 하겠습니다. 그대로 진행하시려면 예 아니면 다른 언어를 입력해주세요"}
         else:
-            session["stage"] = "dockerhub_check"
-            return {"message": "Dockerfile이 이미 존재합니다. 다음 단계: Docker Hub 확인."}
+            session["stage"] = "github_actions_setup"
+            return {"message": "Dockerfile이 이미 존재합니다. 다음 단계: github_actions_setup."}
     # -----------------------
     # 2) Dockerfile 확인 단계
     # -----------------------
@@ -201,9 +201,9 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         )
 
         subprocess.run(["git", "-C", repo_path, "push", push_url, "HEAD"], check=True)
-        session["stage"] = "dockerhub_check"
+        session["stage"] = "github_actions_setup"
         return {
-            "message": f" {primary_lang} 기준으로 Dockerfile을 생성 성공입니다. docker hub 레포지토리는 어떤 이름을 사용하시겠습니까?"
+            "message": f" {primary_lang} 기준으로 Dockerfile을 생성 성공입니다. 깃헙액션?"
         }
 
 
@@ -230,7 +230,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
     # -----------------------
     elif session["stage"] == "github_actions_setup":
         owner = session["owner"]
-        repo = session["dockerhub_repo_name"]
+        repo = session["repo"]
         prompt = f"""
         사용자 메시지: "{req.message}"
 
@@ -278,7 +278,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
                 uses: docker/build-push-action@v5
                 with:
                   push: true
-                  tags: {DOCKERHUB_USERNAME}/{repo}:${{{{ github.sha }}}}
+                  tags: {DOCKERHUB_USERNAME}/docker:${{{{ github.sha }}}}
         """
         repository = gh.get_repo(f"{owner}/{repo}")
         path = ".github/workflows/docker-build.yml"
@@ -321,7 +321,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         # --- 2. GPT에게 Deployment, Service, Kustomize, App YAML 생성 요청 ---
         gpt_yaml_prompt = f"""
         GitHub repo: {session['github_url']}
-        Docker 이미지: {DOCKERHUB_USERNAME}/{session['repo']}:latest
+        Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
         Namespace: {namespace}
         App name: {app_name}
 
