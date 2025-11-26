@@ -1,13 +1,12 @@
 import os
-import json
-
 import openai
 from fastapi import FastAPI
 from pydantic import BaseModel
 from github import Github
-from typing import Optional
+
 import httpx
-import asyncio
+
+import subprocess
 
 # 환경변수
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -114,40 +113,54 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             "repo": repo
         })
 
-        return {"message": f"GitHub URL 확인: {github_url}. Dockerfile 존재 여부를 확인합니다."}
-
-    # -----------------------
-    # 2) Dockerfile 확인 단계
-    # -----------------------
-    elif session["stage"] == "dockerfile_check":
         owner, repo = session["owner"], session["repo"]
         dockerfile_exists = await check_dockerfile_exists(owner, repo)
         session["dockerfile_exists"] = dockerfile_exists
 
         if not dockerfile_exists:
-            session["stage"] = "dockerfile_create"
-            return {"message": "Dockerfile이 없습니다. 생성하시겠습니까? (예/아니오)"}
+            languages = repo.get_languages()
+            primary_lang = max(languages, key=languages.get)
+            session["primary_lang"] = primary_lang
+            return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}이 맞나요?"}
         else:
             session["stage"] = "dockerhub_check"
             return {"message": "Dockerfile이 이미 존재합니다. 다음 단계: Docker Hub 확인."}
+    # -----------------------
+    # 2) Dockerfile 확인 단계
+    # -----------------------
+    elif session["stage"] == "dockerfile_check":
+        primary_lang = session["primary_lang"]
+        github_url = session["github_url"]
+        owner = session["owner"]
+        repo = session["repo"]
 
-    # -----------------------
-    # 3) Dockerfile 생성 단계
-    # -----------------------
-    elif session["stage"] == "dockerfile_create":
-        if "예" in req.message:
-            owner, repo = session["owner"], session["repo"]
-            dockerfile_prompt = f"GitHub repo {owner}/{repo}에 적합한 Dockerfile 예제를 만들어주세요."
-            dockerfile_content = await query_gpt(dockerfile_prompt)
-            success = await generate_dockerfile(owner, repo, dockerfile_content)
-            session["dockerfile_exists"] = success
-            session["stage"] = "dockerhub_check"
-            return {"message": "Dockerfile을 생성했습니다. 다음 단계: Docker Hub 확인."}
-        else:
-            session["stage"] = "dockerhub_check"
-            return {"message": "Dockerfile 생성 건너뜀. 다음 단계: Docker Hub 확인."}
+        repo_path = f"/tmp/{owner}_{repo}"
+        dockerfile_path = os.path.join(repo_path, "Dockerfile")
 
-    # -----------------------
+        lang_check_prompt = f"""
+            사용자가 말한 GitHub repo의 추정 주 언어는 {primary_lang}입니다.
+            최적의 Dockerfile을 생성해주세요.
+            """
+
+        dockerfile_content = await query_gpt(lang_check_prompt)
+
+        with open(dockerfile_path, "w", encoding="utf-8") as f:
+            f.write(dockerfile_content.strip())
+
+        push_url = github_url.replace(
+            "https://", f"https://{GITHUB_TOKEN}@"
+        )
+
+        subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
+        subprocess.run(["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"], check=True)
+        subprocess.run(["git", "-C", repo_path, "push", push_url, "HEAD"], check=True)
+
+        session["stage"] = "dockerhub_check"
+        return {
+            "message": f" {primary_lang} 기준으로 Dockerfile을 생성 성공입니다. docker hub 레포지토리는 어떤 이름을 사용하시겠습니까?"
+        }
+
+
     # 4) Docker Hub 확인 단계
     # -----------------------
     elif session["stage"] == "dockerhub_check":
