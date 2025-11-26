@@ -85,7 +85,7 @@ async def query_gpt(prompt: str):
     import openai
     openai.api_key = OPENAI_API_KEY
     resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o",
         messages=[{"role":"user","content":prompt}],
         temperature=0.7
     )
