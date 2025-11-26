@@ -70,12 +70,29 @@ async def check_dockerhub_repo(repo_name):
         res = await client.get(url, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD))
         return res.status_code == 200
 
-async def create_dockerhub_repo(repo_name):
-    url = f"https://hub.docker.com/v2/repositories/"
-    payload = {"name": repo_name, "is_private": False}
+async def create_dockerhub_repo(repo_name: str):
+    url = "https://hub.docker.com/v2/repositories/"
+    data = {
+        "namespace": DOCKERHUB_USERNAME,
+        "name": repo_name,
+        "is_private": False
+    }
+
     async with httpx.AsyncClient() as client:
-        res = await client.post(url, json=payload, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD))
-        return res.status_code in (200, 201)
+        res = await client.post(
+            url,
+            json=data,
+            auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD)
+        )
+        return res.status_code in [200, 201]
+
+
+async def dockerhub_repo_exists(repo_name: str):
+    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        return res.status_code == 200
 
 # -------------------------------
 # 대화형 API
@@ -118,7 +135,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         session["dockerfile_exists"] = dockerfile_exists
 
         if not dockerfile_exists:
-            languages = repo.get_languages()
+            repo_obj = gh.get_repo(f"{owner}/{repo}")
+            languages = repo_obj.get_languages()
             primary_lang = max(languages, key=languages.get)
             session["primary_lang"] = primary_lang
             return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}이 맞나요?"}
@@ -164,15 +182,15 @@ URL이 없으면 빈 문자열("")을 반환하세요.
     # 4) Docker Hub 확인 단계
     # -----------------------
     elif session["stage"] == "dockerhub_check":
-        repo = session["repo"]
-        dockerhub_exists = await check_dockerhub_repo(repo)
-        session["dockerhub_repo_exists"] = dockerhub_exists
-        if not dockerhub_exists:
-            session["stage"] = "dockerhub_create"
-            return {"message": f"Docker Hub 레포 {repo}가 없습니다. 생성하시겠습니까? (예/아니오)"}
-        else:
-            session["stage"] = "workflow_create"
-            return {"message": "Docker Hub 레포가 존재합니다. 다음 단계: GitHub Action workflow 생성."}
+        repo_name = req.message.strip()
+        session["dockerhub_repo_name"] = repo_name
+        exists = await dockerhub_repo_exists(repo_name)
+        if exists:
+            return {
+                "message": f"도커허브 레포지토리 '{repo_name}'가 존재합니다. 다음 단계로 넘어갑니다."
+            }
+        created = await create_dockerhub_repo(repo_name)
+
 
     # -----------------------
     # 5) Docker Hub 생성 단계
