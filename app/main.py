@@ -177,6 +177,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         os.makedirs(os.path.dirname(dockerfile_path), exist_ok=True)
         with open(dockerfile_path, "w", encoding="utf-8") as f:
             f.write(dockerfile_content.strip())
+        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Lee Kuk Hyeon"], check=True)
+        subprocess.run(["git", "-C", repo_path, "config", "user.email", "0504lkh@naver.com"], check=True)
 
         subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
         status = subprocess.run(
