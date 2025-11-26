@@ -25,7 +25,7 @@ app = FastAPI(title="CI/CD GPT Manager")
 # Request 모델
 # -------------------------------
 class ChatRequest(BaseModel):
-    user_id: str  # 사용자 식별용 (세션 key)
+
     message: str  # 사용자 메시지
 
 # -------------------------------
