@@ -244,9 +244,15 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         }}
         """
         branch_info = await query_gpt(prompt)
-        branch_data = json.loads(branch_info)
+        try:
+            branch_data = json.loads(branch_info)
+        except json.JSONDecodeError:
+            branch_data = {"branch": "main", "os": "ubuntu-latest", "error": "JSONDecodeError"}
+
         branch = branch_data.get("branch", "main")
+        os_runner = branch_data.get("os", "ubuntu-latest")
         session["branch"] = branch
+
         os_runner = branch_data.get("os", "ubuntu-latest")
 
         workflow_content = f"""
