@@ -286,7 +286,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             existing_file = repository.get_contents(path)
             repository.update_file(path, "Update Docker build workflow", workflow_content, existing_file.sha)
             session["stage"] = "argocd_setup"
-            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다. "}
+            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다.namespace와 application 명을 입력해주세요 "}
 
         except:
             repository.create_file(path, "Add Docker build workflow", workflow_content)
@@ -300,6 +300,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         사용자 메시지: "{req.message}"
 
         이 메시지에서 ArgoCD Application 생성에 필요한 namespace와 application 이름을 JSON으로 반환하세요.
+        json값만 반환하세요
         출력 형식:
         {{
           "namespace": "...",
@@ -326,7 +327,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         App name: {app_name}
 
         이 정보를 기반으로 Kubernetes Deployment.yaml, Service.yaml, kustomization.yaml, ArgoCD Application(app.yaml) 생성해주세요.
-        출력 형식은 JSON으로 해주시고 딱 json값만 응답해주세요 안그러면 에러나요:
+        다음 형식으로 **정확히 JSON만** 반환하세요.  
+        절대로 추가 설명을 붙이지 마세요.
         {{
           "deployment_yaml": "...",
           "service_yaml": "...",
