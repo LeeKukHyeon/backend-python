@@ -291,7 +291,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         except:
             repository.create_file(path, "Add Docker build workflow", workflow_content)
             session["stage"] = "argocd_setup"
-            return {"message": "여기서 GitHub Action workflow 생성, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다."}
+            return {"message": "여기서 GitHub Action workflow 생성, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다. namespace와 application 명을 입력해주세요"}
 
 
     elif session["stage"] == "argocd_setup":
@@ -326,7 +326,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         App name: {app_name}
 
         이 정보를 기반으로 Kubernetes Deployment.yaml, Service.yaml, kustomization.yaml, ArgoCD Application(app.yaml) 생성해주세요.
-        출력 형식은 JSON:
+        출력 형식은 JSON으로 해주시고 딱 json값만 응답해주세요 안그러면 에러나요:
         {{
           "deployment_yaml": "...",
           "service_yaml": "...",
