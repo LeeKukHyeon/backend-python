@@ -1,3 +1,4 @@
+import json
 import os
 import openai
 from fastapi import FastAPI
@@ -161,7 +162,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             """
 
         dockerfile_content = await query_gpt(lang_check_prompt)
-
+        os.makedirs(os.path.dirname(dockerfile_path), exist_ok=True)
         with open(dockerfile_path, "w", encoding="utf-8") as f:
             f.write(dockerfile_content.strip())
 
@@ -186,25 +187,72 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         session["dockerhub_repo_name"] = repo_name
         exists = await dockerhub_repo_exists(repo_name)
         if exists:
+            session["stage"] = "github_actions_setup"
             return {
-                "message": f"도커허브 레포지토리 '{repo_name}'가 존재합니다. 다음 단계로 넘어갑니다."
+                "message": f"도커허브 레포지토리 '{repo_name}'가 존재합니다. GitHub Actions workflow를 생성합니다. 특별히 원하는 브랜치가 있나요? (예: main 브랜치 push 시 자동 빌드)"
             }
         created = await create_dockerhub_repo(repo_name)
+        session["stage"] = "github_actions_setup"
+        return {
+            "message": f"도커허브 레포지토리 '{repo_name}'가 존재하지 않아 새로 생성했습니다! GitHub Actions workflow를 생성합니다. 특별히 원하는 브랜치가 있나요? (예: main 브랜치 push 시 자동 빌드)"
+        }
 
 
     # -----------------------
     # 5) Docker Hub 생성 단계
     # -----------------------
-    elif session["stage"] == "dockerhub_create":
-        if "예" in req.message:
-            repo = session["repo"]
-            success = await create_dockerhub_repo(repo)
-            session["dockerhub_repo_exists"] = success
-            session["stage"] = "workflow_create"
-            return {"message": f"Docker Hub 레포 {repo} 생성 완료. 다음 단계: GitHub Action workflow 생성."}
-        else:
-            session["stage"] = "workflow_create"
-            return {"message": "Docker Hub 생성 건너뜀. 다음 단계: GitHub Action workflow 생성."}
+    elif session["stage"] == "github_actions_setup":
+        owner = session["owner"]
+        repo = session["dockerhub_repo_name"]
+        prompt = f"""
+        사용자 메시지: "{req.message}"
+
+        이 메시지에서 GitHub 배포용 브랜치 이름과 운영체제(OS) 정보를 JSON으로 반환하세요.
+        출력 예시:
+        {{
+          "branch": "main",
+          "os": "ubuntu-latest",
+          "error": null
+        }}
+        """
+        branch_info = await query_gpt(prompt)
+        branch_data = json.loads(branch_info)
+        branch = branch_data.get("branch", "main")
+        os_runner = branch_data.get("os", "ubuntu-latest")
+
+        workflow_content = f"""
+        name: Docker Build & Push
+
+        on:
+          push:
+            branches: [ {branch} ]
+
+        jobs:
+          build-and-push:
+            runs-on: {os_runner}
+            steps:
+              - uses: actions/checkout@v3
+              - name: Set up Docker Buildx
+                uses: docker/setup-buildx-action@v2
+              - name: Log in to Docker Hub
+                uses: docker/login-action@v2
+                with:
+                  username: ${{{{ secrets.DOCKERHUB_USERNAME }}}}
+                  password: ${{{{ secrets.DOCKER_PASSWORD }}}}
+              - name: Build and push Docker image
+                uses: docker/build-push-action@v5
+                with:
+                  push: true
+                  tags: {DOCKERHUB_USERNAME}/{repo}:${{{{ github.sha }}}}
+        """
+        repository = gh.get_repo(f"{owner}/{repo}")
+        path = ".github/workflows/docker-build.yml"
+        try:
+            existing_file = repository.get_contents(path)
+            repository.update_file(path, "Update Docker build workflow", workflow_content, existing_file.sha)
+        except:
+            repository.create_file(path, "Add Docker build workflow", workflow_content)
+
 
     # -----------------------
     # 6) GitHub Action / ArgoCD 단계
