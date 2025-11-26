@@ -51,7 +51,7 @@ async def check_dockerhub_repo(repo: str) -> bool:
         return res.status_code == 200
 
 async def query_gpt(prompt: str) -> str:
-    response = openai.ChatCompletion.create(
+    response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
