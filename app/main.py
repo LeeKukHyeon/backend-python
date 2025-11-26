@@ -60,7 +60,7 @@ async def check_dockerhub_repo(repo: str) -> bool:
 
 async def query_gpt(prompt: str) -> str:
     response = openai.chat.completions.create(
-        model="gpt-5-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
