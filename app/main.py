@@ -30,6 +30,22 @@ class ChatRequest(BaseModel):
 # -------------------------------
 # 유틸 함수
 # -------------------------------
+
+def parse_github_url(url: str):
+    """
+    GitHub URL을 받아 owner와 repo 이름을 반환합니다.
+    예:
+        https://github.com/LeeKukHyeon/k8s-ai-manager-deploy.git
+        -> owner="LeeKukHyeon", repo="k8s-ai-manager-deploy"
+    """
+    # URL 끝에 / 제거, .git 제거
+    url = url.rstrip("/").replace(".git", "")
+    parts = url.split("/")
+    if len(parts) < 2:
+        raise ValueError(f"올바르지 않은 GitHub URL: {url}")
+    owner, repo = parts[-2], parts[-1]
+    return owner, repo
+
 async def query_gpt(prompt: str) -> str:
     response = openai.chat.completions.create(
         model="gpt-4o",
@@ -87,28 +103,21 @@ async def create_argocd_app(app_name, repo_url, path, cluster_url, namespace):
 # -------------------------------
 @app.post("/api/ci/chat")
 async def ci_chat(req: ChatRequest):
-    # 1) GPT에게 메시지 분석하여 GitHub owner/repo 가져오기
     parse_prompt = f"""
-사용자 메시지: "{req.message}"
+    사용자 메시지: "{req.message}"
 
-GitHub URL을 찾아서 owner와 repo 이름을 JSON으로 반환하세요.
-출력 형식:
-{{
-  "owner": "...",
-  "repo": "...",
-  "error": null
-}}
-URL이 없거나 잘못되면 error에 설명을 넣으세요.
-"""
+    이 메시지에서 GitHub URL 하나만 추출해서 그대로 출력하세요.
+    예: https://github.com/owner/repo.git
+    URL이 없으면 빈 문자열("")을 반환하세요.
+    """
     gpt_output = await query_gpt(parse_prompt)
-    try:
-        repo_info = json.loads(gpt_output)
-        error = repo_info.get("error")
-        if error:
-            return {"message": f"GitHub URL 처리 오류: {error}"}
-        owner, repo = repo_info.get("owner"), repo_info.get("repo")
-    except Exception as e:
-        return {"message": f"GPT 응답 파싱 실패: {str(e)}", "gpt_output": gpt_output}
+    github_url = gpt_output.strip().split()[0]  # 혹시 GPT가 부가 텍스트를 붙여도 첫 단어만 가져오기
+
+    if not github_url.startswith("https://github.com/"):
+        return {"message": "GitHub URL을 찾을 수 없습니다.", "gpt_output": gpt_output}
+
+    # 기존 parse_github_url 함수로 owner, repo 분리
+    owner, repo = parse_github_url(github_url)
 
     # 2) Dockerfile 확인
     dockerfile_exists = await check_dockerfile_exists(owner, repo)
