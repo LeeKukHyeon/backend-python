@@ -140,7 +140,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             languages = repo_obj.get_languages()
             primary_lang = max(languages, key=languages.get)
             session["primary_lang"] = primary_lang
-            return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}이 맞나요?"}
+            return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}로 생성하도록 하겠습니다. 그대로 진행하시려면 예 아니면 다른 언어를 입력해주세요"}
         else:
             session["stage"] = "dockerhub_check"
             return {"message": "Dockerfile이 이미 존재합니다. 다음 단계: Docker Hub 확인."}
@@ -149,6 +149,14 @@ URL이 없으면 빈 문자열("")을 반환하세요.
     # -----------------------
     elif session["stage"] == "dockerfile_check":
         primary_lang = session["primary_lang"]
+        message = req.message
+        if "예" in message or "ok" in message.lower():
+            # 기존 primary_lang 그대로 사용
+            primary_lang = session["primary_lang"]
+        else:
+            # 사용자가 입력한 언어로 변경
+            primary_lang = message.strip()
+        session["primary_lang"] = primary_lang
         github_url = session["github_url"]
         owner = session["owner"]
         repo = session["repo"]
@@ -156,8 +164,11 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         repo_path = f"/tmp/{owner}_{repo}"
         dockerfile_path = os.path.join(repo_path, "Dockerfile")
 
+        if not os.path.exists(repo_path):
+            subprocess.run(["git", "clone", github_url, repo_path], check=True)
+
         lang_check_prompt = f"""
-            사용자가 말한 GitHub repo의 추정 주 언어는 {primary_lang}입니다.
+            GitHub repo의 추정 주 언어는 {primary_lang}입니다.
             최적의 Dockerfile을 생성해주세요.
             """
 
@@ -166,14 +177,16 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         with open(dockerfile_path, "w", encoding="utf-8") as f:
             f.write(dockerfile_content.strip())
 
+        subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
+        subprocess.run(
+            ["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"],
+            check=True
+        )
         push_url = github_url.replace(
             "https://", f"https://{GITHUB_TOKEN}@"
         )
 
-        subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
-        subprocess.run(["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"], check=True)
         subprocess.run(["git", "-C", repo_path, "push", push_url, "HEAD"], check=True)
-
         session["stage"] = "dockerhub_check"
         return {
             "message": f" {primary_lang} 기준으로 Dockerfile을 생성 성공입니다. docker hub 레포지토리는 어떤 이름을 사용하시겠습니까?"
@@ -218,6 +231,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         branch_info = await query_gpt(prompt)
         branch_data = json.loads(branch_info)
         branch = branch_data.get("branch", "main")
+        session["branch"] = branch
         os_runner = branch_data.get("os", "ubuntu-latest")
 
         workflow_content = f"""
@@ -250,16 +264,85 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         try:
             existing_file = repository.get_contents(path)
             repository.update_file(path, "Update Docker build workflow", workflow_content, existing_file.sha)
+            session["stage"] = "argocd_setup"
+            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다."}
+
         except:
             repository.create_file(path, "Add Docker build workflow", workflow_content)
+            session["stage"] = "argocd_setup"
+            return {"message": "여기서 GitHub Action workflow 생성, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다."}
 
 
-    # -----------------------
-    # 6) GitHub Action / ArgoCD 단계
-    # -----------------------
-    elif session["stage"] == "workflow_create":
-        session["stage"] = "completed"
-        return {"message": "여기서 GitHub Action workflow 생성, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다."}
+    elif session["stage"] == "argocd_setup":
+        owner, repo = session["owner"], session["repo"]
+        github_url = session["github_url"]
+        repo_name = session["dockerhub_repo_name"]
+        branch = session["branch"]
+        gpt_ns_prompt = f"""
+        사용자 메시지: "{req.message}"
+
+        이 메시지에서 ArgoCD Application 생성에 필요한 namespace와 application 이름을 JSON으로 반환하세요.
+        출력 형식:
+        {{
+          "namespace": "...",
+          "app_name": "..."
+        }}
+        없으면 기본값 namespace='default', app_name='{repo}-app'로 설정하세요.
+        """
+        gpt_ns_output = await query_gpt(gpt_ns_prompt)
+
+        try:
+
+            ns_info = json.loads(gpt_ns_output)
+            namespace = ns_info.get("namespace", "default")
+            app_name = ns_info.get("app_name", f"{repo}-app")
+        except Exception:
+            # GPT 응답 파싱 실패 시 기본값
+            namespace = "default"
+            app_name = f"{repo}-app"
+
+        argocd_url = ARGOCD_URL.rstrip("/")
+
+        application_payload = {
+            "metadata": {
+                "name": app_name,
+                "namespace": namespace,
+                "annotations": {
+                    # ArgoCD Image Updater annotation
+                    "argocd-image-updater.argoproj.io/myapp.update-strategy": "latest",
+                    "argocd-image-updater.argoproj.io/image-list": f"{DOCKERHUB_USERNAME}/{repo_name}"
+                }
+            },
+            "spec": {
+                "project": "default",
+                "source": {
+                    "repoURL": github_url,
+                    "path": req.repo_path,
+                    "targetRevision": branch
+                },
+                "destination": {
+                    "server": "https://kubernetes.default.svc",
+                    "namespace": namespace
+                },
+                "syncPolicy": {"automated": {"prune": True, "selfHeal": True}}
+            }
+        }
+
+        headers = {"Authorization": f"Bearer {ARGOCD_TOKEN}"}
+
+
+        async with httpx.AsyncClient(verify=False) as client:
+            res = await client.post(f"{argocd_url}/api/v1/applications", headers=headers, json=app_data)
+            if res.status_code in [200, 201]:
+                session["stage"] = "completed"
+                return {
+                    "message": f"ArgoCD Application '{app_name}' 생성 완료. 이제 CI/CD 자동 배포가 활성화됩니다."
+                }
+            else:
+                return {
+                    "message": f"ArgoCD Application 생성 실패: {res.text}"
+                }
+
 
     # -----------------------
     # 완료
