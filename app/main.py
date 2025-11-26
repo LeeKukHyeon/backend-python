@@ -153,7 +153,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
     # 2) Dockerfile 확인 단계
     # -----------------------
     elif session["stage"] == "dockerfile_check":
-        primary_lang = session["primary_lang"]
+
         message = req.message
         if "예" in message or "ok" in message.lower():
             # 기존 primary_lang 그대로 사용
@@ -174,7 +174,8 @@ URL이 없으면 빈 문자열("")을 반환하세요.
 
         lang_check_prompt = f"""
             GitHub repo의 추정 주 언어는 {primary_lang}입니다.
-            최적의 Dockerfile을 생성해주세요.
+            설명 없이 오로지 최적의 Dockerfile만 생성해주세요.
+            
             """
 
         dockerfile_content = await query_gpt(lang_check_prompt)
