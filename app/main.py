@@ -179,10 +179,17 @@ URL이 없으면 빈 문자열("")을 반환하세요.
             f.write(dockerfile_content.strip())
 
         subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
-        subprocess.run(
-            ["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"],
-            check=True
+        status = subprocess.run(
+            ["git", "-C", repo_path, "status", "--porcelain"],
+            capture_output=True, text=True
         )
+        if status.stdout.strip():
+            subprocess.run(
+                ["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"],
+                check=True
+            )
+        else:
+            print("변경 사항이 없어 commit 생략")
         push_url = github_url.replace(
             "https://", f"https://{GITHUB_TOKEN}@"
         )
