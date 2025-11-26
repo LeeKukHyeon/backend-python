@@ -4,6 +4,7 @@ import openai
 from fastapi import FastAPI
 from pydantic import BaseModel
 from github import Github
+from github import InputGitTreeElement
 
 import httpx
 
@@ -274,22 +275,7 @@ URL이 없으면 빈 문자열("")을 반환하세요.
 
 
     elif session["stage"] == "argocd_setup":
-        user = gh.get_user()
-        repo_name = session["repo"] + "argoCD"
-        description = session["repo"] + "argoCD description"
-        repo = user.create_repo(
-            name=repo_name,
-            description=description,
-            private=False  # 필요 시 True로 변경
-        )
-
-
-
-
-        owner, repo = session["owner"], session["repo"]
-        github_url = session["github_url"]
-        repo_name = session["dockerhub_repo_name"]
-        branch = session["branch"]
+        # --- 1. ArgoCD namespace / app_name 추출 (GPT 사용) ---
         gpt_ns_prompt = f"""
         사용자 메시지: "{req.message}"
 
@@ -299,63 +285,87 @@ URL이 없으면 빈 문자열("")을 반환하세요.
           "namespace": "...",
           "app_name": "..."
         }}
-        없으면 기본값 namespace='default', app_name='{repo}-app'로 설정하세요.
+        없으면 기본값 namespace='default', app_name='{session['repo']}-app'로 설정하세요.
         """
         gpt_ns_output = await query_gpt(gpt_ns_prompt)
-
         try:
-
             ns_info = json.loads(gpt_ns_output)
             namespace = ns_info.get("namespace", "default")
-            app_name = ns_info.get("app_name", f"{repo}-app")
+            app_name = ns_info.get("app_name", f"{session['repo']}-app")
         except Exception:
-            # GPT 응답 파싱 실패 시 기본값
             namespace = "default"
-            app_name = f"{repo}-app"
+            app_name = f"{session['repo']}-app"
 
-        argocd_url = ARGOCD_URL.rstrip("/")
+        session.update({"namespace": namespace, "app_name": app_name})
 
-        app_yaml = f"""
-        apiVersion: argoproj.io/v1alpha1
-        kind: Application
-        metadata:
-          name: {app_name}
-          namespace: argocd
-          annotations:
-            argocd-image-updater.argoproj.io/image-list: {DOCKERHUB_USERNAME}/{repo_name}
-            argocd-image-updater.argoproj.io/{repo_name}.update-strategy: latest
-        spec:
-          project: default
-          source:
-            repoURL: {github_url}
-            targetRevision: {branch}
-            path: .
-          destination:
-            server: https://kubernetes.default.svc
-            namespace: {namespace}
-          syncPolicy:
-            automated:
-              prune: true
-              selfHeal: true
+        # --- 2. GPT에게 Deployment, Service, Kustomize, App YAML 생성 요청 ---
+        gpt_yaml_prompt = f"""
+        GitHub repo: {session['github_url']}
+        Docker 이미지: {DOCKERHUB_USERNAME}/{session['repo']}:latest
+        Namespace: {namespace}
+        App name: {app_name}
+
+        이 정보를 기반으로 Kubernetes Deployment.yaml, Service.yaml, kustomization.yaml, ArgoCD Application(app.yaml) 생성해주세요.
+        출력 형식은 JSON:
+        {{
+          "deployment_yaml": "...",
+          "service_yaml": "...",
+          "kustomization_yaml": "...",
+          "app_yaml": "..."
+        }}
         """
-
-        # -----------------------------
-        # 2) GitHub repo에 YAML 커밋/푸시
-        # -----------------------------
+        yaml_output = await query_gpt(gpt_yaml_prompt)
         try:
-            repo.create_file(
-                path="argo-cd-app.yaml",
-                message=f"Add ArgoCD Application for {app_name}",
-                content=app_yaml
-            )
-            gpt_msg = f"ArgoCD Application YAML을 생성하고 GitHub repo {repo_name}에 푸시했습니다."
+            yamls = json.loads(yaml_output)
+            deployment_yaml = yamls["deployment_yaml"]
+            service_yaml = yamls["service_yaml"]
+            kustomization_yaml = yamls["kustomization_yaml"]
+            app_yaml = yamls["app_yaml"]
         except Exception as e:
-            gpt_msg = f"ArgoCD Application YAML 생성/푸시 실패: {str(e)}"
+            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
 
-        # 세션 단계 완료
-        session["stage"] = "completed"
+        # --- 3. GitHub ArgoCD 레포지토리에 Push ---
+        user = gh.get_user()
+        argo_repo_name = session["repo"] + "-argoCD"
+        try:
+            argo_repo = user.get_repo(argo_repo_name)
+        except:
+            argo_repo = user.create_repo(
+                name=argo_repo_name,
+                description=f"{session['repo']} ArgoCD deployment repo",
+                private=False
+            )
 
-        return {"message": gpt_msg, "namespace": namespace, "app_name": app_name}
+        # Push 파일
+        tree_elements = [
+            InputGitTreeElement("deployment.yaml", "100644", "blob", deployment_yaml),
+            InputGitTreeElement("service.yaml", "100644", "blob", service_yaml),
+            InputGitTreeElement("kustomization.yaml", "100644", "blob", kustomization_yaml),
+            InputGitTreeElement("app.yaml", "100644", "blob", app_yaml)
+        ]
+        base_branch = session.get("branch", "main")
+        base_commit = argo_repo.get_branch(base_branch).commit.sha
+        master_tree = argo_repo.get_git_tree(base_commit)
+        new_tree = argo_repo.create_git_tree(tree_elements, base_tree=master_tree)
+        parent = argo_repo.get_git_commit(base_commit)
+        commit = argo_repo.create_git_commit("Add ArgoCD deployment files via GPT", new_tree, [parent])
+        ref = argo_repo.get_git_ref(f"heads/{base_branch}")
+        ref.edit(commit.sha)
+
+        # --- 4. ArgoCD Application 등록 ---
+        # app.yaml 내용은 GPT가 만들어준 것을 그대로 사용하거나, 직접 JSON 변환 후 API 호출 가능
+        async with httpx.AsyncClient(verify=False) as client:
+            res = await client.post(
+                f"{ARGOCD_URL}/api/v1/applications",
+                headers={"Authorization": f"Bearer {ARGOCD_TOKEN}"},
+                json=json.loads(app_yaml)  # GPT가 반환한 app.yaml을 JSON으로 변환
+            )
+
+        session["stage"] = "done"
+        return {
+            "message": f"ArgoCD Application {app_name} 생성 완료. CI/CD 파이프라인이 구축되었습니다. Image Updater로 자동 배포됩니다.",
+            "argocd_response": res.json()
+        }
     # -----------------------
     # 완료
     # -----------------------
