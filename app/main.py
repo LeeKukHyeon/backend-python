@@ -1,10 +1,13 @@
 import json
 import os
+from io import StringIO
+
 import openai
 from fastapi import FastAPI
 from pydantic import BaseModel
 from github import Github
 from github import InputGitTreeElement
+from ruamel.yaml import YAML
 
 import httpx
 
@@ -327,24 +330,85 @@ URL이 없으면 빈 문자열("")을 반환하세요.
         Namespace: {namespace}
         App name: {app_name}
 
-        아래 형식으로 **JSON만** 반환해주세요.  
-절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
-        {{
-          "deployment_yaml": "...",
-          "service_yaml": "...",
-          "kustomization_yaml": "...",
-          "app_yaml": "..."
-        }}
+        argocd application용 **deployment yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
         """
         yaml_output = await query_gpt(gpt_yaml_prompt)
         try:
-            yamls = json.loads(yaml_output)
-            deployment_yaml = yamls["deployment_yaml"]
-            service_yaml = yamls["service_yaml"]
-            kustomization_yaml = yamls["kustomization_yaml"]
-            app_yaml = yamls["app_yaml"]
+            yaml = YAML()
+            yaml.preserve_quotes = True  # 원본 따옴표 유지
+            data = yaml.load(yaml_output)  # 문자열 파싱
+            stream = StringIO()
+            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
+            deployment_yaml = stream.getvalue()
+
+
         except Exception as e:
             return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
+
+        gpt_yaml_prompt = f"""
+                GitHub repo: {session['github_url']}
+                Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
+                Namespace: {namespace}
+                App name: {app_name}
+
+                argocd application용 **service yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
+                """
+        yaml_output = await query_gpt(gpt_yaml_prompt)
+        try:
+            yaml = YAML()
+            yaml.preserve_quotes = True  # 원본 따옴표 유지
+            data = yaml.load(yaml_output)  # 문자열 파싱
+            stream = StringIO()
+            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
+            service_yaml = stream.getvalue()
+
+
+        except Exception as e:
+            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
+
+        gpt_yaml_prompt = f"""
+                        GitHub repo: {session['github_url']}
+                        Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
+                        Namespace: {namespace}
+                        App name: {app_name}
+
+                        argocd application용 **kustomization_yaml yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
+                        """
+        yaml_output = await query_gpt(gpt_yaml_prompt)
+        try:
+            yaml = YAML()
+            yaml.preserve_quotes = True  # 원본 따옴표 유지
+            data = yaml.load(yaml_output)  # 문자열 파싱
+            stream = StringIO()
+            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
+            kustomization_yaml = stream.getvalue()
+
+
+        except Exception as e:
+            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
+
+        gpt_yaml_prompt = f"""
+                                GitHub repo: {session['github_url']}
+                                Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
+                                Namespace: {namespace}
+                                App name: {app_name}
+
+                                argocd application용 **app_yaml yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
+                                """
+        yaml_output = await query_gpt(gpt_yaml_prompt)
+        try:
+            yaml = YAML()
+            yaml.preserve_quotes = True  # 원본 따옴표 유지
+            data = yaml.load(yaml_output)  # 문자열 파싱
+            stream = StringIO()
+            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
+            app_yaml = stream.getvalue()
+
+
+        except Exception as e:
+            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
+
+
 
         # --- 3. GitHub ArgoCD 레포지토리에 Push ---
         user = gh.get_user()

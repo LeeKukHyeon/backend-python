@@ -5,3 +5,4 @@ openai
 kubernetes
 requests
 PyGithub>=1.59.0
+ruamel.yaml
