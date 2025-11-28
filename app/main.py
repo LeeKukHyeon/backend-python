@@ -1,39 +1,32 @@
 import json
 import os
-from io import StringIO
-
+import gitlab
 import openai
 from fastapi import FastAPI
 from pydantic import BaseModel
-from github import Github
-from github import InputGitTreeElement
+from io import StringIO
 from ruamel.yaml import YAML
 
-import httpx
-
-import subprocess
-
-# 환경변수
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-DOCKERHUB_USERNAME = os.environ.get("DOCKERHUB_USERNAME")
-DOCKERHUB_PASSWORD = os.environ.get("DOCKERHUB_PASSWORD")
-ARGOCD_URL = os.environ.get("ARGOCD_URL")
-ARGOCD_TOKEN = os.environ.get("ARGOCD_TOKEN")
+GITLAB_URL = os.environ.get("GITLAB_URL", "192.168.113.26:1081")
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN") # Personal Access Token (api scope 필수)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-gh = Github(GITHUB_TOKEN)
+openai.api_key = OPENAI_API_KEY
 
-app = FastAPI(title="CI/CD GPT Manager")
+# GitLab 클라이언트 초기화
+gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
+
+app = FastAPI(title="GitLab CI/CD GPT Manager")
 
 # -------------------------------
 # Request 모델
 # -------------------------------
 class ChatRequest(BaseModel):
     user_id: str
-    message: str  # 사용자 메시지
+    message: str
 
 # -------------------------------
-# 세션 상태 관리 (메모리 예시)
+# 세션 상태 관리
 # -------------------------------
 sessions = {}
 
@@ -44,418 +37,257 @@ async def query_gpt(prompt: str) -> str:
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+        temperature=0.7
     )
     return response.choices[0].message.content
 
-def parse_github_url(url: str):
-    url = url.rstrip("/").replace(".git", "")
-    parts = url.split("/")
-    return parts[-2], parts[-1]
 
-async def check_dockerfile_exists(owner, repo):
+def get_gitlab_project(url_or_path: str):
+    """URL에서 프로젝트 경로 추출 및 객체 반환"""
+    # 예: https://gitlab.com/mygroup/myproject.git -> mygroup/myproject
+    clean_path = url_or_path.replace(GITLAB_URL, "").replace(".git", "").strip("/")
+    if clean_path.startswith("http"):  # 다른 도메인 입력 시 방어
+        clean_path = clean_path.split("/")[-2] + "/" + clean_path.split("/")[-1]
+
     try:
-        repository = gh.get_repo(f"{owner}/{repo}")
-        repository.get_contents("Dockerfile")
-        return True
-    except:
-        return False
+        project = gl.projects.get(clean_path)
+        return project
+    except Exception as e:
+        print(f"Error finding project: {e}")
+        return None
 
-async def generate_dockerfile(owner, repo, content):
-    repo_obj = gh.get_repo(f"{owner}/{repo}")
+def commit_file(project, file_path, content, commit_message, branch="main"):
+    """GitLab API를 사용하여 파일 생성 또는 수정"""
     try:
-        repo_obj.create_file("Dockerfile", "Add Dockerfile", content)
-        return True
-    except:
-        return False
-
-async def check_dockerhub_repo(repo_name):
-    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
-    async with httpx.AsyncClient() as client:
-        res = await client.get(url, auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD))
-        return res.status_code == 200
-
-async def create_dockerhub_repo(repo_name: str):
-    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
-    data = {
-        "namespace": DOCKERHUB_USERNAME,
-        "name": repo_name,
-        "is_private": False
-    }
-
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            url,
-            json=data,
-            auth=(DOCKERHUB_USERNAME, DOCKERHUB_PASSWORD)  # 또는 Access Token
-        )
-        if res.status_code in [200, 201]:
-            return True
-        else:
-            print("Docker Hub 생성 실패:", res.status_code, res.text)
-            return False
+        f = project.files.get(file_path=file_path, ref=branch)
+        # 파일이 존재하면 업데이트
+        f.content = content
+        f.save(branch=branch, commit_message=commit_message, encoding='text')
+        return "updated"
+    except gitlab.exceptions.GitlabGetError:
+        # 파일이 없으면 생성
+        project.files.create({
+            'file_path': file_path,
+            'branch': branch,
+            'content': content,
+            'commit_message': commit_message
+        })
+        return "created"
 
 
-async def dockerhub_repo_exists(repo_name: str):
-    url = f"https://hub.docker.com/v2/repositories/{DOCKERHUB_USERNAME}/{repo_name}/"
-
-    async with httpx.AsyncClient() as client:
-        res = await client.get(url)
-        return res.status_code == 200
-
-# -------------------------------
-# 대화형 API
-# -------------------------------
 @app.post("/api/ci/chat")
 async def ci_chat(req: ChatRequest):
     # 세션 초기화
     if req.user_id not in sessions:
-        sessions[req.user_id] = {"stage": "url_parse", "github_url": None, "owner": None, "repo": None}
+        sessions[req.user_id] = {"stage": "url_parse"}
 
-    session = sessions[req.user_id]
+        session = sessions[req.user_id]
 
-    # -----------------------
-    # 1) URL 추출 단계
-    # -----------------------
-    if session["stage"] == "url_parse":
-        prompt = f"""
-사용자 메시지: "{req.message}"
-
-이 메시지에서 GitHub URL 하나만 추출해서 그대로 출력하세요.
-예: https://github.com/owner/repo.git
-URL이 없으면 빈 문자열("")을 반환하세요.
-"""
-        gpt_output = await query_gpt(prompt)
-        github_url = gpt_output.strip().split()[0]
-
-        if not github_url.startswith("https://github.com/"):
-            return {"message": "GitHub URL을 찾을 수 없습니다.", "gpt_output": gpt_output}
-
-        owner, repo = parse_github_url(github_url)
-        session.update({
-            "stage": "dockerfile_check",
-            "github_url": github_url,
-            "owner": owner,
-            "repo": repo
-        })
-
-        owner, repo = session["owner"], session["repo"]
-        dockerfile_exists = await check_dockerfile_exists(owner, repo)
-        session["dockerfile_exists"] = dockerfile_exists
-
-        if not dockerfile_exists:
-            repo_obj = gh.get_repo(f"{owner}/{repo}")
-            languages = repo_obj.get_languages()
-            primary_lang = max(languages, key=languages.get)
-            session["primary_lang"] = primary_lang
-            return {"message": f"Dockerfile이 없습니다. 생성합니다. 주언어가 {primary_lang}로 생성하도록 하겠습니다. 그대로 진행하시려면 예 아니면 다른 언어를 입력해주세요"}
-        else:
-            session["stage"] = "github_actions_setup"
-            return {"message": "Dockerfile이 이미 존재합니다. 다음 단계: github_actions_setup."}
-    # -----------------------
-    # 2) Dockerfile 확인 단계
-    # -----------------------
-    elif session["stage"] == "dockerfile_check":
-
-        message = req.message
-        if "예" in message or "ok" in message.lower():
-            # 기존 primary_lang 그대로 사용
-            primary_lang = session["primary_lang"]
-        else:
-            # 사용자가 입력한 언어로 변경
-            primary_lang = message.strip()
-        session["primary_lang"] = primary_lang
-        github_url = session["github_url"]
-        owner = session["owner"]
-        repo = session["repo"]
-
-        repo_path = f"/tmp/{owner}_{repo}"
-        dockerfile_path = os.path.join(repo_path, "Dockerfile")
-
-        if not os.path.exists(repo_path):
-            subprocess.run(["git", "clone", github_url, repo_path], check=True)
-
-        lang_check_prompt = f"""
-            GitHub repo의 추정 주 언어는 {primary_lang}입니다.
-            설명 없이 오로지 최적의 Dockerfile만 생성해주세요.
-            
-            """
-
-        dockerfile_content = await query_gpt(lang_check_prompt)
-        os.makedirs(os.path.dirname(dockerfile_path), exist_ok=True)
-        with open(dockerfile_path, "w", encoding="utf-8") as f:
-            f.write(dockerfile_content.strip())
-        subprocess.run(["git", "-C", repo_path, "config", "user.name", "Lee Kuk Hyeon"], check=True)
-        subprocess.run(["git", "-C", repo_path, "config", "user.email", "0504lkh@naver.com"], check=True)
-
-        subprocess.run(["git", "-C", repo_path, "add", "Dockerfile"], check=True)
-        status = subprocess.run(
-            ["git", "-C", repo_path, "status", "--porcelain"],
-            capture_output=True, text=True
-        )
-        if status.stdout.strip():
-            subprocess.run(
-                ["git", "-C", repo_path, "commit", "-m", "Add auto-generated Dockerfile"],
-                check=True
-            )
-        else:
-            print("변경 사항이 없어 commit 생략")
-        push_url = github_url.replace(
-            "https://", f"https://{GITHUB_TOKEN}@"
-        )
-
-        subprocess.run(["git", "-C", repo_path, "push", push_url, "HEAD"], check=True)
-        session["stage"] = "github_actions_setup"
-        return {
-            "message": f" {primary_lang} 기준으로 Dockerfile을 생성 성공입니다. 깃헙액션?"
-        }
-
-
-    # 4) Docker Hub 확인 단계
-    # -----------------------
-    elif session["stage"] == "dockerhub_check":
-        repo_name = req.message.strip()
-        session["dockerhub_repo_name"] = repo_name
-        exists = await dockerhub_repo_exists(repo_name)
-        if exists:
-            session["stage"] = "github_actions_setup"
-            return {
-                "message": f"도커허브 레포지토리 '{repo_name}'가 존재합니다. GitHub Actions workflow를 생성합니다. 특별히 원하는 브랜치가 있나요? (예: main 브랜치 push 시 자동 빌드)"
-            }
-        created = await create_dockerhub_repo(repo_name)
-        session["stage"] = "github_actions_setup"
-        return {
-            "message": f"도커허브 레포지토리 '{repo_name}'가 존재하지 않아 새로 생성했습니다! GitHub Actions workflow를 생성합니다. 특별히 원하는 브랜치가 있나요? (예: main 브랜치 push 시 자동 빌드)"
-        }
-
-
-    # -----------------------
-    # 5) Docker Hub 생성 단계
-    # -----------------------
-    elif session["stage"] == "github_actions_setup":
-        owner = session["owner"]
-        repo = session["repo"]
-        prompt = f"""
-        사용자 메시지: "{req.message}"
-
-        다음 형식으로 **정확히 JSON만** 반환하세요.  
-        절대로 추가 설명을 붙이지 마세요.
-        예시:
-        {{
-          "branch": "main",
-          "os": "ubuntu-latest",
-          "error": null
-        }}
-        """
-        branch_info = await query_gpt(prompt)
-        try:
-            branch_data = json.loads(branch_info)
-        except json.JSONDecodeError:
-            branch_data = {"branch": "main", "os": "ubuntu-latest", "error": "JSONDecodeError"}
-
-        branch = branch_data.get("branch", "main")
-        os_runner = branch_data.get("os", "ubuntu-latest")
-        session["branch"] = branch
-
-        os_runner = branch_data.get("os", "ubuntu-latest")
-
-        workflow_content = f"""
-        name: Docker Build & Push
-
-        on:
-          push:
-            branches: [ {branch} ]
-
-        jobs:
-          build-and-push:
-            runs-on: {os_runner}
-            steps:
-              - uses: actions/checkout@v3
-              - name: Set up Docker Buildx
-                uses: docker/setup-buildx-action@v2
-              - name: Log in to Docker Hub
-                uses: docker/login-action@v2
-                with:
-                  username: ${{{{ secrets.DOCKERHUB_USERNAME }}}}
-                  password: ${{{{ secrets.DOCKER_PASSWORD }}}}
-              - name: Build and push Docker image
-                uses: docker/build-push-action@v5
-                with:
-                  push: true
-                  tags: {DOCKERHUB_USERNAME}/docker:${{{{ github.sha }}}}
-        """
-        repository = gh.get_repo(f"{owner}/{repo}")
-        path = ".github/workflows/docker-build.yml"
-        try:
-            existing_file = repository.get_contents(path)
-            repository.update_file(path, "Update Docker build workflow", workflow_content, existing_file.sha)
-            session["stage"] = "argocd_setup"
-            return {"message": "여기서 GitHub Action workflow 업데이트, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다.namespace와 application 명을 입력해주세요 "}
-
-        except:
-            repository.create_file(path, "Add Docker build workflow", workflow_content)
-            session["stage"] = "argocd_setup"
-            return {"message": "여기서 GitHub Action workflow 생성, ArgoCD Application 생성, CI/CD 자동 배포를 진행하도록 합니다. namespace와 application 명을 입력해주세요"}
-
-
-    elif session["stage"] == "argocd_setup":
-        # --- 1. ArgoCD namespace / app_name 추출 (GPT 사용) ---
-        gpt_ns_prompt = f"""
-        사용자 메시지: "{req.message}"
-
-        이 메시지에서 ArgoCD Application 생성에 필요한 namespace와 application 이름을 JSON으로 반환하세요.
-        json값만 반환하세요
-        출력 형식:
-        {{
-          "namespace": "...",
-          "app_name": "..."
-        }}
-        없으면 기본값 namespace='default', app_name='{session['repo']}-app'로 설정하세요.
-        """
-        gpt_ns_output = await query_gpt(gpt_ns_prompt)
-        try:
-            ns_info = json.loads(gpt_ns_output)
-            namespace = ns_info.get("namespace", "default")
-            app_name = ns_info.get("app_name", f"{session['repo']}-app")
-        except Exception:
-            namespace = "default"
-            app_name = f"{session['repo']}-app"
-
-        session.update({"namespace": namespace, "app_name": app_name})
-
-        # --- 2. GPT에게 Deployment, Service, Kustomize, App YAML 생성 요청 ---
-        gpt_yaml_prompt = f"""
-        GitHub repo: {session['github_url']}
-        Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
-        Namespace: {namespace}
-        App name: {app_name}
-
-        argocd application용 **deployment yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
-        """
-        yaml_output = await query_gpt(gpt_yaml_prompt)
-        try:
-            yaml = YAML()
-            yaml.preserve_quotes = True  # 원본 따옴표 유지
-            data = yaml.load(yaml_output)  # 문자열 파싱
-            stream = StringIO()
-            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
-            deployment_yaml = stream.getvalue()
-
-
-        except Exception as e:
-            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
-
-        gpt_yaml_prompt = f"""
-                GitHub repo: {session['github_url']}
-                Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
-                Namespace: {namespace}
-                App name: {app_name}
-
-                argocd application용 **service yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
+        # ==========================================
+        # 1) GitLab 프로젝트 URL 파싱
+        # ==========================================
+        if session["stage"] == "url_parse":
+            prompt = f"""
+                사용자 메시지: "{req.message}"
+                이 메시지에서 GitLab 프로젝트 URL을 추출하고 URL만 반환하세요.
+                URL이 없다면 빈 문자열을 반환하세요.
                 """
-        yaml_output = await query_gpt(gpt_yaml_prompt)
-        try:
-            yaml = YAML()
-            yaml.preserve_quotes = True  # 원본 따옴표 유지
-            data = yaml.load(yaml_output)  # 문자열 파싱
-            stream = StringIO()
-            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
-            service_yaml = stream.getvalue()
+            gpt_output = await query_gpt(prompt)
+            url = gpt_output.strip()
+
+            if "http" not in url:
+                return {"message": "GitLab URL을 찾을 수 없습니다. 올바른 URL을 입력해주세요."}
+
+            project = get_gitlab_project(url)
+            if not project:
+                return {"message": "GitLab 프로젝트를 찾을 수 없거나 접근 권한이 없습니다. 토큰과 URL을 확인해주세요."}
+
+            session.update({
+                "stage": "dockerfile_check",
+                "project_id": project.id,
+                "project_path_with_namespace": project.path_with_namespace,
+                "web_url": project.web_url,
+                "default_branch": project.default_branch or "main"
+            })
+            # Dockerfile 존재 여부 확인
+            try:
+                project.files.get(file_path="Dockerfile", ref=session["default_branch"])
+                dockerfile_exists = True
+            except:
+                dockerfile_exists = False
+
+            if not dockerfile_exists:
+                        # 주 언어 감지 (간단히 가장 많이 쓰인 언어)
+                        langs = project.languages()
+                        primary_lang = list(langs.keys())[0] if langs else "Python"
+                        session["primary_lang"] = primary_lang
+                        return {"message": f"프로젝트({project.path_with_namespace}) 확인 완료.\n"
+                                           f"Dockerfile이 없습니다. 주 언어인 '{primary_lang}' 기반으로 생성할까요? (예/아니오)"}
+            else:
+                session["stage"] = "agent_check"
+                return {"message": f"프로젝트 연결 성공. Dockerfile이 이미 존재합니다.\n다음으로 GitLab Agent 연결 정보를 입력받겠습니다."}
+
+        # ==========================================
+        # 2) Dockerfile 생성
+        # ==========================================
+        elif session["stage"] == "dockerfile_check":
+            project = gl.projects.get(session["project_id"])
+
+            prompt = f"""
+            사용자 메시지: "{req.message}"
+
+            당신은 Dockerfile 생성 여부를 묻는 질문("주 언어(예: Python) 기반으로 생성할까요? (예/아니오)")에 대한 사용자의 응답을 분석해야 합니다.
+
+            1. 사용자가 '네', '예', 'ok', '응' 등 긍정의 의미를 전달했다면, 'status'는 'AGREE'로 설정합니다.
+            2. 사용자가 '아니오'이거나, 'Java', 'Node.js', 'Go' 등 특정 언어 이름을 제시했다면, 'status'는 'DISAGREE'로 설정하고, 'language' 필드에 사용자가 제시한 언어 이름 또는 'DISAGREE'를 그대로 넣습니다.
+
+            JSON 형식으로만 결과를 반환하세요. 절대로 설명이나 추가 텍스트를 붙이지 마세요.
+
+            예시 1 (긍정): {{"status": "AGREE"}}
+            예시 2 (언어 제시): {{"status": "DISAGREE", "language": "Java"}}
+            예시 3 (부정): {{"status": "DISAGREE", "language": "DISAGREE"}}
+            """
+            response_str = await query_gpt(prompt)
+            intent_result = json.loads(response_str)
+            if intent_result.get("status") == "AGREE":
+                # 긍정 응답이면, 기존 primary_lang 그대로 사용
+                target_lang = session.get("primary_lang", "Python")
+
+            elif intent_result.get("status") == "DISAGREE":
+                # 부정 또는 언어 제시 응답
+                user_input_lang = intent_result.get("language")
+                if user_input_lang and user_input_lang != "DISAGREE":
+                    # 사용자가 특정 언어를 제시한 경우 (예: Java)
+                    target_lang = user_input_lang
+                else:
+                    # 사용자가 단순히 부정(아니오)만 한 경우, 기본 언어 사용 또는 재질문 필요
+                    # 여기서는 재질문을 위해 상태를 유지하고 메시지를 반환합니다.
+                    return {"message": "Dockerfile 생성을 원하지 않으시거나 다른 언어를 원하신다면, 원하시는 언어 이름(예: Node.js)을 명확히 입력해주세요."}
+
+            else:
+                # GPT 응답 오류 시 처리
+                return {"message": "응답 분석 중 오류가 발생했습니다. '예' 또는 언어 이름을 입력해주세요."}
 
 
-        except Exception as e:
-            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
+            # GPT에게 Dockerfile 작성 요청
+            prompt = f"""
+            언어: {target_lang}
+            프로젝트 상황: GitLab CI에서 빌드될 예정.
+            최적의 Dockerfile 내용만 출력하세요. 마크다운 없이 raw text로.
+            """
+            dockerfile_content = await query_gpt(prompt)
 
-        gpt_yaml_prompt = f"""
-                        GitHub repo: {session['github_url']}
-                        Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
-                        Namespace: {namespace}
-                        App name: {app_name}
+            # GitLab API로 커밋
+            commit_file(project, "Dockerfile", dockerfile_content, "Add Dockerfile via GPT Manager",
+                        session["default_branch"])
 
-                        argocd application용 **kustomization_yaml yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
+            session["stage"] = "agent_check"
+            return {
+                "message": f"{target_lang} 기반 Dockerfile이 생성되었습니다.\n이제 배포를 위한 **GitLab Agent 이름**을 정해주세요.\n(예: test-agent)"}
+
+        elif session["stage"] == "agent_check":
+            # 1. GPT에게 Agent 이름만 요청
+            prompt = f"""
+                    사용자 메시지: "{req.message}"
+                    이 메시지에서 GitLab Kubernetes Agent의 이름만 추출하세요.
+                    이름 외의 다른 텍스트는 무시하고 Agent 이름만 반환하세요.
+                    """
+            agent_name = (await query_gpt(prompt)).strip()
+
+            if not agent_name:
+                return {"message": "Agent 이름을 추출하지 못했습니다. Agent 이름만 입력해주세요. (예: my-k8s-agent)"}
+
+            agent_repo_path = "test1"
+
+            try:
+                agent_management_project = gl.projects.get(agent_repo_path)
+            except Exception:
+                return {"message": f"Agent 관리 프로젝트 경로({agent_repo_path})를 찾을 수 없거나 접근 권한이 없습니다. 관리 프로젝트 경로를 확인해주세요."}
+
+            config_file_path = f".gitlab/agents/{agent_name}/config.yaml"
+            app_project_path = session["project_path_with_namespace"]
+            app_project_id = session["project_id"]
+
+            try:
+                # 파일 가져오기 (UPDATE 모드 시도)
+                f = agent_management_project.files.get(file_path=config_file_path, ref=session["default_branch"])
+                yaml_content = f.decode().decode('utf-8')
+                yaml = YAML()
+                config_data = yaml.load(yaml_content)
+                config_data.setdefault('ci_access', {}).setdefault('projects', [])
+                is_already_listed = any(
+                    p.get('id') == app_project_id or
+                    p.get('id') == app_project_path for p in config_data['ci_access']['projects']
+                )
+                update_message = "Agent 설정 파일에 현재 프로젝트 권한을 추가했습니다."
+                if not is_already_listed:
+                    config_data['ci_access']['projects'].append({'id': app_project_path})
+                else:
+                    update_message = "Agent 설정 파일에 현재 프로젝트 권한이 이미 존재합니다."
+
+                # 업데이트된 YAML 내용을 StringIO로 변환
+                stream = StringIO()
+                yaml.dump(config_data, stream)
+                new_yaml_content = stream.getvalue()
+
+                # GitLab API를 통해 파일 업데이트 커밋
+                f.content = new_yaml_content
+                f.save(
+                    branch=session["default_branch"],
+                    commit_message=update_message,
+                    encoding='text'
+                )
+
+                action_status = "수정 및 커밋"
+
+            except gitlab.exceptions.GitlabGetError:
+                # 파일이 존재하지 않음 (CREATE 모드)
+                new_yaml_content = f"""
+                ci_access:
+                  projects:
+                    - id: {app_project_path}
+                """
+                # GitLab API를 통해 새 파일 커밋
+                agent_management_project.files.create({
+                    'file_path': config_file_path,
+                    'branch': session["default_branch"],
+                    'content': new_yaml_content.strip(),
+                    'commit_message': f"Add initial config for Agent {agent_name} and grant access to {app_project_path}"
+                })
+
+                action_status = "새로 생성 및 커밋"
+
+            except Exception as e:
+                return {"message": f"Agent 설정 파일 처리 중 예기치 않은 오류 발생: {str(e)}"}
+
+            # 5. 세션 데이터 저장 및 다음 단계로 이동
+            session["agent_name"] = agent_name
+            session["agent_path"] = agent_repo_path  # 'test1' 저장
+
+            session["stage"] = "generate_manifests"
+
+            return {
+                "message": f"""
+                        ✅ Agent 관리 프로젝트 **{agent_repo_path}**에 **{agent_name}** Agent 설정 파일이 **{action_status}**되었습니다.
+                        (현재 프로젝트 **{app_project_path}**에 대한 CI/CD 접근 권한 부여 완료)
+
+                        이제 Kubernetes 배포 파일(YAML)과 .gitlab-ci.yml을 생성하고 커밋하겠습니다.
+                        배포할 네임스페이스(namespace)를 입력해주세요. (기본값: default)
                         """
-        yaml_output = await query_gpt(gpt_yaml_prompt)
-        try:
-            yaml = YAML()
-            yaml.preserve_quotes = True  # 원본 따옴표 유지
-            data = yaml.load(yaml_output)  # 문자열 파싱
-            stream = StringIO()
-            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
-            kustomization_yaml = stream.getvalue()
+            }
+        elif session["stage"] == "generate_manifests":
+            prompt = f"""
+                              사용자 메시지: "{req.message}"
+                              이 메시지에서 네임스페이스의 이름만 추출하세요.
+                              이름 외의 다른 텍스트는 무시하고 네임스페이스 이름만 반환하세요.
+                              """
+            namespace = (await query_gpt(prompt)).strip()
+            if not namespace:
+                namespace = "default"
 
+            project = gl.projects.get(session["project_id"])
+            app_name = project.path  # 프로젝트 이름을 앱 이름으로 사용
+            # GitLab Registry 이미지 주소
+            # 예: registry.gitlab.com/group/project:commit-sha
+            image_placeholder = "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
 
-        except Exception as e:
-            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
-
-        gpt_yaml_prompt = f"""
-                                GitHub repo: {session['github_url']}
-                                Docker 이미지: {DOCKERHUB_USERNAME}/docker:latest
-                                Namespace: {namespace}
-                                App name: {app_name}
-
-                                argocd application용 **app_yaml yaml만** 반환해주세요. yaml 형식에 맞게 들여쓰기까지 해주세요. 절대로 설명, 코드 블록, 마크다운, 추가 텍스트를 붙이지 마세요.
-                                """
-        yaml_output = await query_gpt(gpt_yaml_prompt)
-        try:
-            yaml = YAML()
-            yaml.preserve_quotes = True  # 원본 따옴표 유지
-            data = yaml.load(yaml_output)  # 문자열 파싱
-            stream = StringIO()
-            yaml.dump(data, stream)  # 자동 정렬된 YAML 생성
-            app_yaml = stream.getvalue()
-
-
-        except Exception as e:
-            return {"message": f"YAML 생성 실패: {str(e)}", "gpt_output": yaml_output}
-
-
-
-        # --- 3. GitHub ArgoCD 레포지토리에 Push ---
-        user = gh.get_user()
-        argo_repo_name = session["repo"] + "-argoCD"
-        try:
-            argo_repo = user.get_repo(argo_repo_name)
-        except:
-            argo_repo = user.create_repo(
-                name=argo_repo_name,
-                description=f"{session['repo']} ArgoCD deployment repo",
-                private=False
-            )
-
-        # Push 파일
-        tree_elements = [
-            InputGitTreeElement("deployment.yaml", "100644", "blob", deployment_yaml),
-            InputGitTreeElement("service.yaml", "100644", "blob", service_yaml),
-            InputGitTreeElement("kustomization.yaml", "100644", "blob", kustomization_yaml),
-            InputGitTreeElement("app.yaml", "100644", "blob", app_yaml)
-        ]
-        base_branch = session.get("branch", "main")
-        base_commit = argo_repo.get_branch(base_branch).commit.sha
-        master_tree = argo_repo.get_git_tree(base_commit)
-        new_tree = argo_repo.create_git_tree(tree_elements, base_tree=master_tree)
-        parent = argo_repo.get_git_commit(base_commit)
-        commit = argo_repo.create_git_commit("Add ArgoCD deployment files via GPT", new_tree, [parent])
-        ref = argo_repo.get_git_ref(f"heads/{base_branch}")
-        ref.edit(commit.sha)
-
-        # --- 4. ArgoCD Application 등록 ---
-        # app.yaml 내용은 GPT가 만들어준 것을 그대로 사용하거나, 직접 JSON 변환 후 API 호출 가능
-        async with httpx.AsyncClient(verify=False) as client:
-            res = await client.post(
-                f"{ARGOCD_URL}/api/v1/applications",
-                headers={"Authorization": f"Bearer {ARGOCD_TOKEN}"},
-                json=json.loads(app_yaml)  # GPT가 반환한 app.yaml을 JSON으로 변환
-            )
-
-        session["stage"] = "done"
-        return {
-            "message": f"ArgoCD Application {app_name} 생성 완료. CI/CD 파이프라인이 구축되었습니다. Image Updater로 자동 배포됩니다.",
-            "argocd_response": res.json()
-        }
-    # -----------------------
-    # 완료
-    # -----------------------
-    elif session["stage"] == "completed":
-        return {"message": "배포 프로세스가 이미 완료되었습니다."}
-
-    return {"message": "알 수 없는 상태입니다."}
