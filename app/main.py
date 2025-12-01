@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from io import StringIO
 from ruamel.yaml import YAML
 
-GITLAB_URL = os.environ.get("GITLAB_URL", "192.168.113.26:1081")
+GITLAB_URL = os.environ.get("GITLAB_URL", "http://192.168.113.26:1081")
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN") # Personal Access Token (api scope 필수)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
