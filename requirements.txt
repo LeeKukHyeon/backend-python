@@ -4,5 +4,5 @@ pydantic
 openai
 kubernetes
 requests
-PyGithub>=1.59.0
+python-gitlab
 ruamel.yaml
