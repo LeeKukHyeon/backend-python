@@ -94,7 +94,7 @@ async def ci_chat(req: ChatRequest):
             """
         gpt_output = await query_gpt(prompt)
         url = gpt_output.strip()
-        print(url)
+
         if "http" not in url:
             return {"message": "GitLab URL을 찾을 수 없습니다. 올바른 URL을 입력해주세요."}
 
@@ -148,6 +148,7 @@ async def ci_chat(req: ChatRequest):
         예시 3 (부정): {{"status": "DISAGREE", "language": "DISAGREE"}}
         """
         response_str = await query_gpt(prompt)
+        print(response_str)
         intent_result = json.loads(response_str)
         if intent_result.get("status") == "AGREE":
             # 긍정 응답이면, 기존 primary_lang 그대로 사용
