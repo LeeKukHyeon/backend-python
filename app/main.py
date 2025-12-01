@@ -94,7 +94,7 @@ async def ci_chat(req: ChatRequest):
             """
         gpt_output = await query_gpt(prompt)
         url = gpt_output.strip()
-
+        print(url)
         if "http" not in url:
             return {"message": "GitLab URL을 찾을 수 없습니다. 올바른 URL을 입력해주세요."}
 
